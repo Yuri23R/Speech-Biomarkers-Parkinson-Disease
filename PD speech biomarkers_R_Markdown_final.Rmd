@@ -1,0 +1,533 @@
+---
+title: "Speech Biomarkers of Parkinson's Disease"
+author: "Yuri Rykov"
+date: "April 11, 2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Exploratory data analysis and predictive modelling
+### Contents
+i. Reading data and checking dimensionality
+1. Exploratory analysis  
+1.1. Univariate analysis (Descriptive statistics)  
+1.1.1. Demographics  
+1.1.2. Health history, medications and clinical exam (symptoms)  
+1.1.3. Speech features  
+1.2. Bivariate and multivariave analysis  
+1.2.1. Correlation matrix of speech features  
+1.2.2. Scatterplots of speech features  
+1.2.3. PCA of speech features  
+1.2.4. Cluster analysis of participants using speech features  
+2. Predictive modelling: 'early' detection of neurodegeneration  
+2.1. PD patients -vs- healthy controls  
+2.2. PD and RBD patients -vs- healthy controls  
+2.3. Multiclass prediction with 3 classes (PD, RBD and healthy controls)  
+2.4. Neurodegeneration symptoms' severity prediction (numeric prediction)  
+3. Finding patterns of neurodegeneration symptoms and predicting them by speech features  
+3.1. Finding symptom patterns with k-means cluster analysis  
+3.2. Predicting cluster of symptoms with speech features  
+
+### Read data and checking
+```{r}
+setwd("C:/R_neuro")
+df = read.csv("dataset.csv")
+dim(df) # dimensions of dataframe (sample size and variables)
+lapply(df, class) # checking types of the data
+names(df)[42:65] = paste0("SF", seq(1,24)) # rename speech fetures with shorter names
+```
+Dataset is relatively small, it contains 130 cases (participants) and 65 variables.
+
+### Group variables
+```{r}
+pred.dem = names(df[2:3]) # age and gender
+pred.hist = names(df[4:6]) # health history
+pred.meds = names(df[7:12]) # medications
+mot.exam = names(df[13:14]) # clinical motor examination scores
+symptoms = names(df[15:41]) # UPDRS III motor scale items (symptoms)
+pred.voice = names(df[42:65]) # only 24 speech features (12 features x 2 speech tests)
+
+df$label = substring(df$Participant..code, 1,2) #define labels - diagnostic category
+```
+
+## 1. Exploratory analysis
+### 1.1. Univariate analysis (Descriptive statistics)
+#### 1.1.1. Demographics
+```{r message=FALSE, warning=FALSE}
+library(psych)
+library(Hmisc)
+library(ggplot2)
+df$a = "i" #create pseudo group
+describe(df$Gender)
+```
+
+Gender piechart
+```{r}
+ggplot(df, aes(x="", y=Gender, fill=Gender)) + geom_bar(width = 1, stat = "identity") + coord_polar("y", start=0) + 
+  theme_void() + xlab("") + scale_fill_manual(values=c("salmon", "royalblue"))
+```
+
+```{r}
+describeBy(df$Age...years., group = df$a, mat=T, digits=3)[-c(1:4,8,9,15)]
+```
+
+Age histogram
+```{r message=FALSE}
+qplot(Age...years., data = df, geom = "histogram")
+```
+
+Age-gender density plot
+```{r}
+qplot(Age...years., data = df, geom = "density", color = Gender)
+```
+
+#### 1.1.2. Health history, medications and clinical exam (symptoms)
+```{r}
+table(df$Positive..history..of..Parkinson..disease..in..family) #check values of one variable
+```
+This value "-" means missing, should be replaced with proper missings (NAs).
+
+```{r}
+df[df == "-"] <- NA #replace "-" with NAs throughtout the dataset
+ds2 = describe(df[,c(pred.hist, pred.meds, mot.exam, symptoms)])
+ds2 # print descriptions of variables
+```
+
+Only medication variables from this set of features do not have missings.
+All health history and clinical exam variables contain missings (N=50).
+Clinical exam varaible (Hoehn & Yahr scale) has 100 missings.  
+Where do these missings come from?  
+
+Checking against participant lables.
+```{r}
+table(is.na(df$Age..of..disease..onset...years.)==T, df$label)
+table(is.na(df$X28...Posture)==T, df$label)
+table(is.na(df$Overview..of..motor..examination...Hoehn.....Yahr..scale.....)==T, df$label)
+
+```
+Almost all missing values are in healthy controls group
+Missing values in clinical exam variable (Hoehn & Yahr scale) also came from RBD group (REM sleep behaviour disorder)
+
+Check distribution of medication variables among participants groups.
+```{r}
+for (i in 1:6) { 
+  print(pred.meds[i])
+  print(table(df[,pred.meds[i]],df$label)) }
+```
+Medication variables have zero or near zer ovariance, reporting medication is very rare.
+
+#### 1.1.3. Speech features
+```{r}
+table(is.na(df[,c(pred.voice)])==T) #check for missings
+```
+No missings among speech features
+
+Descriptive statistics of speech features
+```{r}
+ds = describeBy(df[,c(pred.voice)], group=df$a, mat=T, digits=3)
+ds[,-c(1:4,8,9,15)] #show results (hide some statistics)
+```
+
+#### Speech features histograms
+#### 1. Speaking task of reading passage
+```{r message=FALSE}
+hist.list1 = lapply(
+ pred.voice[1:12], 
+  function(n) 
+    ggplot(data = df, aes_string(x = n)) + 
+    geom_histogram(fill="royalblue3") + theme_bw()
+)
+cowplot::plot_grid(plotlist = hist.list1)
+```
+
+#### 2. Speaking task of monologue
+```{r message=FALSE}
+hist.list2 = lapply(
+  pred.voice[13:24], 
+  function(n) 
+    ggplot(data = df, aes_string(x = n)) + 
+    geom_histogram(fill="royalblue3") + theme_bw()
+)
+cowplot::plot_grid(plotlist = hist.list2)
+```
+
+Most speech features do not look normally distributed, maybe further variable transformations will be needed. 
+
+#### Testing normality of distributions: one-sample Kolmogorov-Smirnov test
+```{r warning=FALSE}
+#Kolmogorov-Smirnov Tests - normality of distribution
+kst.results = NULL
+for (i in pred.voice) {
+  kst = round(ks.test(df[,c(i)],"pnorm", mean(df[,c(i)]), sd(df[,c(i)]))$p.value,3)
+  kst.results = rbind(kst.results, cbind(i, kst))
+}
+as.data.frame(kst.results)
+table(as.numeric( as.character( as.data.frame(kst.results)$kst))>=0.05)
+```
+16 features out of 24 are distributed normally.  
+
+
+#### Conclusion 1: 
+Only demographic and speech features are complete for all participants. Healthy controls do not have health history and clinical exam inforamation, and medication varialbes have zero variance (same values for all healthy controls). Thus, only demographics and speech features can be used for predictive modelling for 'early' detection of Parkinson's Disease. Information on clinical exam (symptoms) can be further used for clustering patients and finding disease subgroups.
+
+### 1.2. Bivariate analysis
+#### 1.2.1. Correlation matrix of speech features
+```{r message=FALSE, warning=FALSE}
+library(corrplot)
+cor2 <- rcorr(as.matrix(df[,pred.voice]), type = "spearman") # compute correlation matrix
+df.cor <- cor2$r # Spearman rank correlation coefficients
+p.mat <- cor2$P # p-values
+
+library(RColorBrewer)
+col <- colorRampPalette(brewer.pal(9, "RdBu"))
+```
+
+#### Correlation matrix (with coefficients and clustered)  
+White cells are non-significant correlations (P-value > .01)
+```{r }
+corrplot(df.cor, method="color", col=col(100),  
+         type="lower", 
+         addCoef.col = "black",
+         tl.col="black", tl.srt=45, 
+         p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         diag=F, number.cex=0.5, tl.cex = 0.8)
+
+corrplot(df.cor, method="color", col=col(100),  
+         type="lower", order="hclust", hclust.method = "centroid",
+         tl.col="black", tl.srt=45, 
+         p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         diag=F, number.cex=0.5, tl.cex = 0.8 )
+```
+
+#### Corelation matrix heatmap with feature clustering
+```{r }
+heatmap(x = df.cor, col = col(20), symm = TRUE)
+```
+
+#### 1.2.2. Scatterplots of selected speech features
+
+Closer look at correlated groups of features
+```{r }
+pairs.panels(df[,c("SF4", "SF5", "SF16", "SF17", "SF19")], 
+             method = "spearman", # correlation method
+             hist.col = "royalblue3",
+             density = F,  # show density plots
+             ellipses = F, # show correlation ellipses
+             smooth = F, pch=19, cex.cor=0.6,cex=0.7)
+```
+
+```{r }
+pairs.panels(df[,c("SF13", "SF14", "SF18", "SF22")], 
+             method = "spearman", # correlation method
+             hist.col = "royalblue3",
+             density = F,  # show density plots
+             ellipses = F, # show correlation ellipses
+             smooth = F, pch=19, cex.cor=0.6,cex=0.8)
+
+```
+
+
+#### 1.2.3. PCA of speech features
+Principal Components Analysis (PCA) allows deeper understanding of feature relations structure and revealing latent factors behind features. Thus, it can be used for reduction of dimensionality and feature selection in predictive modelling.  
+```{r message=FALSE}
+library(factoextra)
+set.seed(123)
+pc <- prcomp(df[,pred.voice], scale.=T)
+df.scores = pc$x # save individual data with component scores (can be used instead of features for prediction)
+t(summary(pc)$importance) # importance of components (proportion of explained variance)
+fviz_screeplot(pc, ncp=24, barfill = "royalblue3") # importance of components
+corrplot(t(pc$rotation), tl.col="black") # plot feature loadings (contributions) in components
+```
+
+#### Feature contribution to 16 most important components
+```{r }
+fviz_contrib(pc, choice = "var", axes = 1:16, fill = "royalblue3")
+```
+1st component explains 29% of variance, wherein it is composed of multiple features with modest contribution, while other components explains <10% each. 16 components explain ~95% of total variability, and the contribution of functions to these components is fairly equal. Thus, there is not much benefit in reducing dimensionality, all features can contribute to models' performance.
+
+#### Conclusion 2:
+All speech features potentially can contribute to models' performance.  
+
+#### 1.2.4.Cluster analysis of participants using speech features
+Rescale speech features within 0-1 range
+```{r }
+df.c = df
+range01 <- function(x, ...){(x - min(x, ...)) / (max(x, ...) - min(x, ...))} # custom rescale function
+df.c[,pred.voice] = sapply(df.c[,pred.voice],range01) # rescale values between 0 and 1
+```  
+
+#### Cluster analysis with k-means  
+Find optimal number of clusters: Elbow method
+```{r }
+fviz_nbclust(as.matrix(df.c[,pred.voice]), kmeans, method = "wss") +
+  geom_vline(xintercept = 4, linetype = 2)+
+  labs(subtitle = "Elbow method")
+```
+
+```{r }
+set.seed(123)
+clan <- kmeans(as.matrix(df.c[,pred.voice]), 4, nstart = 25) # k-mean clustering (k=4)
+df.c$SF.cluster.4 = clan$cluster
+table(df.c$SF.cluster.4)
+```
+Clusters are comparable by size.
+
+#### Multidimensional Scaling  
+This method helps to triangulate clustering solution and visualize it along main latent dimensions  
+```{r }
+d <- dist(df.c[,pred.voice], method = "euclidean") # euclidean distances between the rows
+mds.sf <- cmdscale(d,eig=TRUE, k=2)
+
+# plot solution
+df.c$x <- mds.sf$points[,1]
+df.c$y <- mds.sf$points[,2]
+
+ggplot(data = df.c, aes(x = x, y = y,  color=as.factor(SF.cluster.4))) + 
+  geom_point(size=2) +
+  theme_bw() + ylab("Dim 2") + xlab("Dim 1") + ggtitle("Multidimensional Scaling") +
+  scale_color_manual(values=c("green2", "magenta2", "mediumblue", "red"))
+```
+
+Multidimensional scaling reduces 24 speech features into two-dimensional representation keeping maximum variability as possible. The scatterplot shows how participants clusters differ from each other along these dimensions. Groupings are pretty clear within this transformed speech feature space, hence this clustering probably captured some existing speech differences between participants.  
+
+```{r }
+ggplot(data = df.c, aes(x = x, y = y, color=label)) + 
+  geom_point(size=2) +
+  theme_bw() + ylab("Dim 2") + xlab("Dim 1") + ggtitle("Multidimensional Scaling") +
+  scale_color_manual(values=c("gray50", "tomato", "gold"))
+```
+
+This scatterplot shows how diagnostic groups differ from each other along these dimensions. PD and RBD patients tend to have higher Dim 2 and lower Dim 1, while healthy controls tend to have inverse parameters - lower Dim 2 and higher Dim 1. The top left corner of the plot mainly has PD and RBD patients (red and gold), while bottom right corner mainly has healthy controls (grey).
+
+```{r }
+ggplot(data = df.c, aes(x = x, y = y, shape=label, color=as.factor(SF.cluster.4))) + 
+  geom_point(size=2) +
+  theme_bw() + ylab("Dim 2") + xlab("Dim 1") + ggtitle("Multidimensional Scaling") +
+  scale_shape_manual(values=c(19,2,0)) +
+  scale_color_manual(values=c("green2", "magenta2", "mediumblue", "red"))
+```
+
+Finally, this scatterplot shows both diagnostic groups and speech clusters of aprticipants. Healthy controls are mainly concentrated in clusters 3 and 4 (blue and red), while clusters 1 and 2 (green and purple) are mainly comprised of PD and RBD patients. The cross-tabulation below shows it.  
+
+```{r }
+table(df.c$label, df.c$SF.cluster.4)
+```
+
+## 2. Predictive modelling: 'early' detection of neurodegeneration (classification)
+For detection of neurodegeneration (calssification) we will use:  
+1. Three variants of outcomes (labels/classes):  
+1.1. PD patients -vs- healthy controls  
+1.2. PD and RBD patients -vs- healthy controls  
+1.3. Multiclass prediction with 3 classes (PD, RBD and healthy controls)  
+2. Four machine learning algorithms (naive Bayes, KNN, random forest, XGBoost). Features are handcrafted, and there is no need for deep learning.  
+3. Two cross-validation methods (LOOCV, f-fold)  
+
+### 2.1. PD patients -vs- healthy controls
+```{r message=FALSE, warning=FALSE}
+library(caret)
+library(MLeval)
+library(doParallel)
+
+df2 = df[df$label!="RB",] #subsample dataset (exclude RBD patients)
+
+algs = c("nb", "knn", "rf", "xgbDART") # list of ML algorithms
+set.seed(123)
+cvIndex <- createFolds(factor(df2$label), 5, returnTrain = T)
+k.fold <- trainControl(index = cvIndex,
+                       method="cv", number = 5,
+                       savePredictions = "final",
+                       classProbs=T) # setup cross-validation method: k-fold
+set.seed(123)
+LOOCV <- trainControl(method="LOOCV", 
+                      savePredictions = "final",classProbs=T) # setup cross-validation method: leave-one-out-cross-validation
+
+cla <- makePSOCKcluster(6) #parallel computing: allocate available CPU cores
+registerDoParallel(cla)
+
+perf.res = NULL
+for (i in algs) { # model training loop with 5 ML methods and 2 cross-validation
+
+set.seed(987)
+mod1 <- train(label~., method=as.name(i), data = df2[,c("label", pred.voice)],
+              trControl=k.fold ,na.action  = na.pass) 
+auroc1 <- evalm(mod1, positive = "PD", showplots=F)
+CM1 = c(alg=i, CV="k-fold", round(confusionMatrix(mod1$pred$pred, mod1$pred$obs, positive = "PD")$overall[c(1:2,5)],2), round(confusionMatrix(mod1$pred$pred, mod1$pred$obs, positive = "PD")$byClass[c(1:4,7)],2), AUC = auroc1$stdres[[1]]$Score[13])
+
+set.seed(987)
+mod2 <- train(label~., method=as.name(i), data = df2[,c("label", pred.voice)],
+              trControl=LOOCV ,na.action  = na.pass) 
+auroc2 <- evalm(mod2, positive = "PD", showplots=F)
+CM2 = c(alg=i, CV="LOOCV", round(confusionMatrix(mod2$pred$pred, mod2$pred$obs, positive = "PD")$overall[c(1:2,5)],2), round(confusionMatrix(mod2$pred$pred, mod2$pred$obs, positive = "PD")$byClass[c(1:4,7)],2), AUC = auroc2$stdres[[1]]$Score[13])
+
+res = rbind(CM1, CM2)
+perf.res = rbind(perf.res, res)
+  }
+stopCluster(cla)
+```
+
+#### Performance evaluation results
+```{r echo=F, results='asis'}
+library(knitr)
+kable(perf.res)
+```  
+XGBoost showed the best accuracy and AUC.
+
+#### ROC curve of the best model  
+```{r}
+auroc1$roc
+```
+
+#### Confusion matrix of the best model  
+```{r}
+fourfoldplot(confusionMatrix(mod1$pred$pred, mod1$pred$obs, positive = "PD")$table)
+```
+
+XGBoost performed better than others algorithms (76% accuracy and 0.76 AUC), so we will use only XGBoost for other tasks. LOOCV and k-fold cross-validation methods showed similar results, so k-fold cross-validation can be used further due to less computation.
+
+Additionally, we will train predictive models using all available sample and evaluate their performance with cross-validation.
+
+### 2.2. PD and RBD patients -vs- healthy controls
+```{r message=FALSE}
+df$neurodeg = ifelse(df$label == "HC", "control", "case") # create new class variable
+
+set.seed(123)
+cvIndex <- createFolds(factor(df$neurodeg), 10, returnTrain = T)
+k.fold <- trainControl(index = cvIndex,method="cv", number = 10,
+                       savePredictions = "final",classProbs=T) # setup cross-validation method: k-fold
+
+cla <- makePSOCKcluster(6) #Parallel computing - set available number of CPU cores
+registerDoParallel(cla)
+set.seed(987)
+mod3 <- train(neurodeg~., method="xgbDART", data = df[,c("neurodeg", rev(pred.voice))],
+                  trControl=k.fold ,na.action  = na.pass) 
+stopCluster(cla)
+
+confusionMatrix(mod3$pred$pred, mod3$pred$obs)
+auroc3 = evalm(mod3, positive = "case", plots = "r")
+```
+
+
+### 2.3. Multiclass prediction with 3 classes (PD, RBD and healthy controls)
+Given the interesting results of cluster analysis based on speech features from section 1.2.4, we will use here the extended feature set including cluster memberships to train the model for multiclass calssification.  
+
+```{r message=FALSE, warning=FALSE}
+set.seed(123)
+cvIndex <- createFolds(factor(df.c$label), 5, returnTrain = T)
+k.fold <- trainControl(index = cvIndex,method="cv", number = 5, 
+                       savePredictions = "final",  
+                       classProbs=T) # setup cross-validation method: k-fold
+
+df.c$SF.cluster.4 = as.factor(df.c$SF.cluster.4)
+cla <- makePSOCKcluster(6) #Parallel computing - set available number of CPU cores
+registerDoParallel(cla)
+set.seed(987)
+mod4 <- train(label~., method="xgbDART", data = df.c[,c("label","SF.cluster.4", pred.voice)],
+              trControl=k.fold, na.action = na.pass) # the model additionally includes cluster membership 
+stopCluster(cla)
+
+confusionMatrix(mod4$pred$pred, mod4$pred$obs)
+```
+Multiclass classification accuracy is 61%, no info rate is 38%, hence the model showed 23% of absolute accurcay growth and and 60% improvement compared to 'random' calssification [(61-38)/38].
+
+### 2.4. Neurodegeneration symptoms’ severity prediction (numeric prediction)
+For prediction of neurodegeneration severity (numeric prediction) we will use  motor examination score - UPDRS III total.  
+
+```{r message=FALSE, warning=FALSE}
+df3 = df[df$label != "HC",] # dataset with only PD and RBD patients 
+
+df3$UPDRS.score = as.numeric( as.character( df3$Overview..of..motor..examination...UPDRS..III..total.....)) #rename outcome and convert to numeric
+set.seed(123)
+k.fold <- trainControl(method="cv", 
+                       number = 10, 
+                       savePredictions = "final", returnResamp = "final") # setup cross-validation method: k-fold
+
+cla <- makePSOCKcluster(6) #Parallel computing - set available number of CPU cores
+registerDoParallel(cla)
+set.seed(987)
+mod5 <- train(UPDRS.score~., method="xgbDART", data = df3[,c("UPDRS.score", pred.voice)],
+              trControl=k.fold, na.action = na.pass)
+stopCluster(cla)
+```
+
+#### Correlation between predicted and observed scores
+```{r}
+cor.test(mod5$pred$pred, mod5$pred$obs)
+qplot(mod5$pred$pred, mod5$pred$obs) + theme_bw() + geom_point(color = "royalblue3")
+```
+
+Correlation coefficient of 0.43 (P value <.001) shows that speech features have potential to assess severity of neurodegeneration symptoms even yet the variation in actual clinical exam scores is quite high.  
+
+## 3. Finding symptom patterns and predicting them by speech features
+### 3.1. Finding symptom patterns with k-means cluster analysis
+#### Preparing data
+```{r}
+df.c2 = df3 
+df.c2[,symptoms] <- sapply(df.c2[,symptoms], as.character) 
+df.c2[,symptoms] <- sapply(df.c2[,symptoms], as.numeric) 
+dichotomize <- function(x, ...){ifelse(x>0, 1, 0)} # custom function to dichotomize values, due to overall rare data and low actual variability 
+df.c2[,symptoms] = sapply(df.c2[,symptoms], dichotomize) # dichotomize
+symptom.preval = colSums(as.matrix(df.c2[,symptoms]))/80 # compute prevalence of symptoms
+symptoms3 = names(which(symptom.preval>0.4)) #selecting only prevalent symptoms (appeared in at least 40% of participants). Rare are symptoms highly likely appear only in more severy PD patients and adding them into k-means clustering will resilt in clustering by the overall severity score rather than by potential subtypes based on symptom patterns (co-occuring symptoms)
+```
+
+#### Find optimal number of clusters: Elbow method
+```{r}
+fviz_nbclust(as.matrix(df.c2[,symptoms3]), kmeans, method = "wss") +
+  geom_vline(xintercept = 4, linetype = 2)+
+  labs(subtitle = "Elbow method")
+```
+
+#### K-means clustering (k = 4)
+```{r}
+set.seed(123)
+clan <- kmeans(as.matrix(df.c2[,symptoms3]), 4, nstart = 25)
+df.c2$cluster.4 = as.factor(clan$cluster)
+levels(df.c2$cluster.4) = c("C1", "C2", "C3", "C4")
+```
+
+Checking how clusters relate to symptom severity  
+```{r}
+boxplot(df.c2$UPDRS.score~df.c2$cluster.4)
+```
+
+Although symptom clusters overlap with overall severity, probably there is another meaningful latent factor/dimension.
+
+#### Multidimensional Scaling  
+This method helps to triangulate clustering solution and visualize it along main latent dimensions  
+```{r}
+d <- dist(df.c2[,symptoms3], method = "euclidean") # compute euclidean distances between participants
+mds <- cmdscale(d,eig=TRUE, k=2)
+
+x1 <- mds$points[,1] # MDS coordiantes
+y1 <- mds$points[,2] # MDS coordiantes
+df.c2$col.4 = ifelse(df.c2$cluster.4=="C2", "red3", 
+                     ifelse(df.c2$cluster.4=="C3", "orange3", 
+                            ifelse(df.c2$cluster.4=="C1", "gold2", "gray20")))
+plot(x1, y1, xlab="Dim 1", ylab="Dim 2",
+     main="Multidimensional Scaling", type="n")
+text(x1, y1, labels = df.c2$label, cex=0.9, col = df.c2$col.4, font = 2)
+```
+
+Dim 1 corresponds to overall symptom severity (red - grey clusters along this axis), and points also vary along Dim 2 (gold - orange clusters along this axis) which captures some other factor than overall severity.
+
+### 3.2. Predicting cluster of symptoms with speech features
+Multiclass classification
+```{r}
+set.seed(123)
+cvIndex <- createFolds(factor(df.c2$cluster.4), 4, returnTrain = T)
+k.fold <- trainControl(index = cvIndex,method="cv", 
+                       number = 4,
+                       savePredictions = "final", 
+                       classProbs=T) # setup cross-validation method: k-fold
+
+cla <- makePSOCKcluster(6) #Parallel computing
+registerDoParallel(cla)
+set.seed(987)
+modA <- train(cluster.4~., method="xgbDART", data = df.c2[,c("cluster.4", pred.voice)],
+              trControl=k.fold, na.action = na.pass)
+stopCluster(cla)
+
+confusionMatrix(modA$pred$pred, modA$pred$obs)
+```
+Although, the overall accuracy is quite low, it is significantly above no info rate (43% vs 30%, p-value = 0.01). Hence the model can classify participants into different symptomatic groups and identify different symptom-based patterns of neurodegeneration.
